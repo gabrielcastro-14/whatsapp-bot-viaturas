@@ -8,14 +8,12 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-// Estado das conversas (guarda em memória)
+// Estado das conversas
 const conversationState = new Map();
 
 // Configuração
 const CONFIG = {
-  // Dia da semana (0=Domingo, 1=Segunda, ..., 5=Sexta)
   sendDay: 1, // Segunda-feira
-  // Hora de envio (formato 24h)
   sendHour: 9,
   sendMinute: 0
 };
@@ -25,23 +23,18 @@ const CONFIG = {
 async function startBot() {
   console.log('🚀 Iniciando bot WhatsApp...');
 
-  // Autenticação (guarda sessão na pasta ./auth)
   const { state, saveCreds } = await useMultiFileAuthState('./auth');
 
-  // Criar conexão WhatsApp
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: true
   });
 
-  // Salvar credenciais quando atualizadas
   sock.ev.on('creds.update', saveCreds);
 
-  // Escutar mensagens recebidas
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
     
-    // Ignorar mensagens sem conteúdo ou enviadas por nós
     if (!msg.message || msg.key.fromMe) return;
 
     const from = msg.key.remoteJid;
@@ -54,127 +47,300 @@ async function startBot() {
     await handleMessage(sock, from, text);
   });
 
-  // Agendar envios semanais
   scheduleWeeklyMessages(sock);
 
   console.log('✅ Bot ativo e pronto!');
   console.log(`📅 Próximo envio: ${getNextSendDate().toLocaleString('pt-PT')}`);
 }
 
+// ===== BUSCAR EQUIPAMENTOS DO COLABORADOR =====
+
+async function getUserEquipment(telefone) {
+  // Remover @s.whatsapp.net e caracteres extras
+  const cleanPhone = telefone.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+  
+  // Buscar colaborador pelo telefone
+  const { data: user, error: userError } = await supabase
+    .from('users')
+    .select('id, nome')
+    .eq('telefone', cleanPhone)
+    .single();
+
+  if (userError || !user) {
+    console.log('❌ Colaborador não encontrado:', cleanPhone);
+    return null;
+  }
+
+  console.log(`✅ Colaborador encontrado: ${user.nome}`);
+
+  const equipment = [];
+
+  // 1. BUSCAR VEHICLES
+  const { data: vehicles } = await supabase
+    .from('vehicles')
+    .select('id, matricula, marca, modelo, km_atual')
+    .eq('responsaveloperacional', user.id)
+    .eq('status', 'disponivel');
+
+  if (vehicles && vehicles.length > 0) {
+    vehicles.forEach(v => {
+      equipment.push({
+        type: 'vehicle',
+        id: v.id,
+        identifier: v.matricula,
+        description: `${v.marca} ${v.modelo}`,
+        current: v.km_atual || 0,
+        unit: 'km'
+      });
+    });
+  }
+
+  // 2. BUSCAR TRUCKS
+  const { data: trucks } = await supabase
+    .from('trucks')
+    .select('id, matricula, marca, modelo, km_atual')
+    .eq('responsaveloperacional', user.id)
+    .eq('status', 'disponivel');
+
+  if (trucks && trucks.length > 0) {
+    trucks.forEach(t => {
+      equipment.push({
+        type: 'truck',
+        id: t.id,
+        identifier: t.matricula,
+        description: `${t.marca} ${t.modelo}`,
+        current: t.km_atual || 0,
+        unit: 'km'
+      });
+    });
+  }
+
+  // 3. BUSCAR MACHINES
+  const { data: machines } = await supabase
+    .from('machines')
+    .select('id, nome, marca, horas_atual')
+    .eq('responsaveloperacional', user.id)
+    .eq('status', 'disponivel');
+
+  if (machines && machines.length > 0) {
+    machines.forEach(m => {
+      equipment.push({
+        type: 'machine',
+        id: m.id,
+        identifier: m.id,
+        description: `${m.nome} - ${m.marca}`,
+        current: m.horas_atual || 0,
+        unit: 'horas'
+      });
+    });
+  }
+
+  return {
+    user,
+    equipment
+  };
+}
+
 // ===== LÓGICA DE CONVERSAÇÃO =====
 
 async function handleMessage(sock, from, text) {
-  const state = conversationState.get(from) || { step: 0 };
+  let state = conversationState.get(from);
 
-  // PASSO 0: Início da conversa
-  if (state.step === 0 || text.toLowerCase().includes('começar')) {
-    conversationState.set(from, { step: 1, startTime: Date.now() });
-    
-    await sock.sendMessage(from, { 
-      text: '🚗 Olá! Vamos registar os quilómetros da viatura.\n\n' +
-            'Por favor, indique a *matrícula* (ex: AA-12-BB):' 
-    });
-    return;
-  }
+  // INÍCIO DA CONVERSA
+  if (!state || text.toLowerCase().includes('começar')) {
+    const data = await getUserEquipment(from);
 
-  // PASSO 1: Receber matrícula
-  if (state.step === 1) {
-    const matricula = text.toUpperCase().trim();
-    
-    // Validação básica de matrícula portuguesa
-    const isValid = /^[A-Z]{2}-\d{2}-[A-Z]{2}$/.test(matricula) ||
-                    /^[A-Z]{2}-\d{2}-\d{2}$/.test(matricula) ||
-                    /^\d{2}-[A-Z]{2}-\d{2}$/.test(matricula);
-    
-    if (!isValid && matricula.length > 3) {
-      conversationState.set(from, { 
-        step: 2, 
-        matricula: matricula,
-        startTime: state.startTime 
+    if (!data || !data.equipment || data.equipment.length === 0) {
+      await sock.sendMessage(from, {
+        text: '❌ Não foram encontrados equipamentos atribuídos a si.\n\n' +
+              'Se acha que isto é um erro, contacte o administrador.'
       });
-      
-      await sock.sendMessage(from, { 
-        text: `📋 Matrícula registada: *${matricula}*\n\n` +
-              'Agora indique os *quilómetros* (apenas números):' 
-      });
-    } else if (isValid) {
-      conversationState.set(from, { 
-        step: 2, 
-        matricula: matricula,
-        startTime: state.startTime 
-      });
-      
-      await sock.sendMessage(from, { 
-        text: `📋 Matrícula registada: *${matricula}*\n\n` +
-              'Agora indique os *quilómetros* (apenas números):' 
-      });
-    } else {
-      await sock.sendMessage(from, { 
-        text: '⚠️ Matrícula inválida. Por favor use o formato correto:\n' +
-              'AA-12-BB ou AA-12-34\n\n' +
-              'Tente novamente:' 
-      });
+      conversationState.delete(from);
+      return;
     }
+
+    // Iniciar conversa
+    state = {
+      userName: data.user.nome,
+      equipment: data.equipment,
+      currentIndex: 0,
+      responses: []
+    };
+
+    conversationState.set(from, state);
+
+    await askCurrentEquipment(sock, from, state);
     return;
   }
 
-  // PASSO 2: Receber quilómetros
-  if (state.step === 2) {
-    const kms = parseInt(text.replace(/\D/g, ''));
+  // PROCESSAR RESPOSTA
+  if (state && state.currentIndex < state.equipment.length) {
+    const current = state.equipment[state.currentIndex];
+    const value = parseInt(text.replace(/\D/g, ''));
 
     // Validar número
-    if (isNaN(kms) || kms < 0) {
-      await sock.sendMessage(from, { 
-        text: '⚠️ Por favor indique um número válido de quilómetros.\n\n' +
-              'Exemplo: 45000' 
+    if (isNaN(value) || value < 0) {
+      await sock.sendMessage(from, {
+        text: `⚠️ Por favor indique um número válido de ${current.unit}.\n\n` +
+              'Exemplo: 45000'
       });
       return;
     }
 
-    // Validar número razoável (até 999.999 km)
-    if (kms > 999999) {
-      await sock.sendMessage(from, { 
-        text: '⚠️ Valor muito alto. Verifique se está correto.\n\n' +
-              'Tente novamente:' 
+    // Validar valor razoável
+    if (current.unit === 'km' && value > 999999) {
+      await sock.sendMessage(from, {
+        text: '⚠️ Valor muito alto para quilómetros. Verifique se está correto.\n\n' +
+              'Tente novamente:'
       });
       return;
     }
 
-    // Guardar no Supabase
-    console.log(`💾 Guardando: ${state.matricula} - ${kms} km`);
-    
-    const { data, error } = await supabase
-      .from('viaturas')
-      .upsert({
-        matricula: state.matricula,
-        kms: kms,
-        telefone: from.replace('@s.whatsapp.net', ''),
-        updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'matricula'
+    if (current.unit === 'horas' && value > 99999) {
+      await sock.sendMessage(from, {
+        text: '⚠️ Valor muito alto para horas. Verifique se está correto.\n\n' +
+              'Tente novamente:'
       });
+      return;
+    }
 
-    if (error) {
-      console.error('❌ Erro Supabase:', error);
-      await sock.sendMessage(from, { 
-        text: '❌ Ocorreu um erro ao guardar os dados.\n' +
-              'Por favor tente novamente mais tarde.\n\n' +
-              'Se o problema persistir, contacte o suporte.' 
-      });
+    // Guardar resposta
+    state.responses.push({
+      equipment: current,
+      value: value
+    });
+
+    // Avançar para próximo equipamento
+    state.currentIndex++;
+    conversationState.set(from, state);
+
+    // Verificar se acabou
+    if (state.currentIndex >= state.equipment.length) {
+      await finishConversation(sock, from, state);
     } else {
-      console.log('✅ Dados guardados com sucesso!');
-      await sock.sendMessage(from, { 
-        text: `✅ *Dados guardados com sucesso!*\n\n` +
-              `🚗 Matrícula: *${state.matricula}*\n` +
-              `📏 Quilómetros: *${kms.toLocaleString('pt-PT')} km*\n` +
-              `📅 Data: ${new Date().toLocaleString('pt-PT')}\n\n` +
-              `Obrigado! 👍` 
+      await askCurrentEquipment(sock, from, state);
+    }
+  }
+}
+
+async function askCurrentEquipment(sock, from, state) {
+  const current = state.equipment[state.currentIndex];
+  const total = state.equipment.length;
+  const position = state.currentIndex + 1;
+
+  let message;
+
+  if (state.currentIndex === 0) {
+    message = `👋 Olá *${state.userName}*!\n\n` +
+              `📋 Encontrei *${total}* equipamento(s) atribuído(s) a si.\n` +
+              `Vamos registar os valores atuais.\n\n` +
+              `━━━━━━━━━━━━━━━━\n\n`;
+  } else {
+    message = `✅ Registado!\n\n`;
+  }
+
+  message += `📊 Equipamento *${position}/${total}*\n\n` +
+             `🚗 *${current.description}*\n` +
+             `📋 ${current.identifier}\n` +
+             `📏 Último valor: ${current.current.toLocaleString('pt-PT')} ${current.unit}\n\n` +
+             `Por favor indique o valor atual de *${current.unit}*:`;
+
+  await sock.sendMessage(from, { text: message });
+}
+
+async function finishConversation(sock, from, state) {
+  console.log('💾 Guardando todos os valores...');
+
+  let successCount = 0;
+  let errorCount = 0;
+  const results = [];
+
+  // Guardar cada resposta na tabela correta
+  for (const response of state.responses) {
+    const { equipment, value } = response;
+
+    try {
+      let result;
+
+      if (equipment.type === 'vehicle') {
+        result = await supabase
+          .from('vehicles')
+          .update({
+            km_atual: value,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', equipment.id);
+      } else if (equipment.type === 'truck') {
+        result = await supabase
+          .from('trucks')
+          .update({
+            km_atual: value,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', equipment.id);
+      } else if (equipment.type === 'machine') {
+        result = await supabase
+          .from('machines')
+          .update({
+            horas_atual: value,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', equipment.id);
+      }
+
+      if (result.error) {
+        console.error(`❌ Erro ao atualizar ${equipment.identifier}:`, result.error);
+        errorCount++;
+        results.push({
+          equipment,
+          value,
+          success: false
+        });
+      } else {
+        console.log(`✅ ${equipment.identifier}: ${value} ${equipment.unit}`);
+        successCount++;
+        results.push({
+          equipment,
+          value,
+          success: true
+        });
+      }
+    } catch (error) {
+      console.error(`❌ Erro ao processar ${equipment.identifier}:`, error);
+      errorCount++;
+      results.push({
+        equipment,
+        value,
+        success: false
       });
     }
-
-    // Limpar estado da conversa
-    conversationState.delete(from);
   }
+
+  // Construir mensagem de resumo
+  let message = `✅ *Registo concluído!*\n\n` +
+                `📊 Resumo:\n` +
+                `━━━━━━━━━━━━━━━━\n\n`;
+
+  results.forEach((r, index) => {
+    const icon = r.success ? '✅' : '❌';
+    message += `${icon} ${r.equipment.description}\n` +
+               `   ${r.equipment.identifier}: *${r.value.toLocaleString('pt-PT')} ${r.equipment.unit}*\n\n`;
+  });
+
+  message += `━━━━━━━━━━━━━━━━\n` +
+             `📅 ${new Date().toLocaleString('pt-PT')}\n\n`;
+
+  if (errorCount > 0) {
+    message += `⚠️ ${errorCount} erro(s) ao guardar.\n` +
+               `Por favor contacte o suporte.`;
+  } else {
+    message += `🎉 Obrigado, *${state.userName}*!`;
+  }
+
+  await sock.sendMessage(from, { text: message });
+
+  // Limpar estado
+  conversationState.delete(from);
 }
 
 // ===== AGENDAMENTO SEMANAL =====
@@ -188,20 +354,17 @@ function getNextSendDate() {
   let daysUntilSend;
 
   if (currentDay < CONFIG.sendDay) {
-    // Ainda não chegou o dia esta semana
     daysUntilSend = CONFIG.sendDay - currentDay;
   } else if (currentDay === CONFIG.sendDay) {
-    // É hoje, verificar hora
     if (
       currentHour < CONFIG.sendHour ||
       (currentHour === CONFIG.sendHour && currentMinute < CONFIG.sendMinute)
     ) {
-      daysUntilSend = 0; // Enviar hoje
+      daysUntilSend = 0;
     } else {
-      daysUntilSend = 7; // Próxima semana
+      daysUntilSend = 7;
     }
   } else {
-    // Já passou, próxima semana
     daysUntilSend = 7 - (currentDay - CONFIG.sendDay);
   }
 
@@ -224,7 +387,7 @@ function scheduleWeeklyMessages(sock) {
 
     setTimeout(async () => {
       await sendWeeklyMessages(sock);
-      scheduleNext(); // Agendar próxima semana
+      scheduleNext();
     }, delay);
   }
 
@@ -235,47 +398,50 @@ async function sendWeeklyMessages(sock) {
   console.log('📨 Iniciando envio semanal...');
 
   try {
-    // Buscar números do Supabase
-    const { data: colaboradores, error } = await supabase
-      .from('colaboradores')
-      .select('telefone, nome');
+    // Buscar todos os colaboradores ativos com telefone
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('nome, telefone')
+      .eq('ativo', true)
+      .not('telefone', 'is', null);
 
     if (error) {
       console.error('❌ Erro ao buscar colaboradores:', error);
       return;
     }
 
-    if (!colaboradores || colaboradores.length === 0) {
-      console.log('⚠️ Nenhum colaborador encontrado na base de dados');
+    if (!users || users.length === 0) {
+      console.log('⚠️ Nenhum colaborador encontrado');
       return;
     }
 
-    console.log(`👥 Encontrados ${colaboradores.length} colaboradores`);
+    console.log(`👥 Encontrados ${users.length} colaboradores`);
 
-    // Enviar para cada colaborador
-    for (const colaborador of colaboradores) {
+    // Enviar para cada colaborador que tenha equipamento
+    for (const user of users) {
       try {
-        const number = `${colaborador.telefone}@s.whatsapp.net`;
-        const nome = colaborador.nome || 'Colaborador';
+        const number = `${user.telefone}@s.whatsapp.net`;
 
-        // Iniciar conversa
-        conversationState.set(number, { step: 1, startTime: Date.now() });
+        // Verificar se tem equipamento atribuído
+        const data = await getUserEquipment(number);
+
+        if (!data || !data.equipment || data.equipment.length === 0) {
+          console.log(`⏭️ ${user.nome} não tem equipamentos atribuídos`);
+          continue;
+        }
 
         await sock.sendMessage(number, {
-          text: `🚗 Olá ${nome}!\n\n` +
-                `Está na altura de registar os quilómetros das viaturas.\n\n` +
-                `Por favor, indique a *matrícula* da viatura (ex: AA-12-BB):`
+          text: `🚗 Olá *${user.nome}*!\n\n` +
+                `Está na altura de registar os valores dos equipamentos.\n\n` +
+                `Responda a esta mensagem com qualquer texto para começar.`
         });
 
-        console.log(`✅ Mensagem enviada para ${colaborador.telefone}`);
+        console.log(`✅ Mensagem enviada para ${user.nome} (${user.telefone})`);
 
-        // Delay entre mensagens (evitar ban do WhatsApp)
+        // Delay entre mensagens
         await new Promise(resolve => setTimeout(resolve, 3000));
       } catch (error) {
-        console.error(
-          `❌ Erro ao enviar para ${colaborador.telefone}:`,
-          error
-        );
+        console.error(`❌ Erro ao enviar para ${user.nome}:`, error);
       }
     }
 
