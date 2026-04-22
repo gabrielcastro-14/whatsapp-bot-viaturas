@@ -9,6 +9,13 @@ const supabase = createClient(
 
 const conversationState = new Map();
 
+// Lista de números para enviar (formato: 351912345678@s.whatsapp.net)
+const CONTACT_NUMBERS = [
+  '351912345678@s.whatsapp.net',
+  '351923456789@s.whatsapp.net',
+  // Adiciona mais números aqui
+];
+
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth');
 
@@ -30,13 +37,16 @@ async function startBot() {
     await handleMessage(sock, from, text);
   });
 
+  // Agendar envio semanal (toda segunda-feira às 9h)
+  scheduleWeeklyMessages(sock);
+
   console.log('✅ Bot WhatsApp ativo!');
 }
 
 async function handleMessage(sock, from, text) {
   const state = conversationState.get(from) || { step: 0 };
 
-  if (state.step === 0) {
+  if (state.step === 0 || text.toLowerCase() === 'começar') {
     conversationState.set(from, { step: 1 });
     await sock.sendMessage(from, { 
       text: 'Olá! Por favor indique a matrícula da viatura:' 
@@ -69,10 +79,60 @@ async function handleMessage(sock, from, text) {
     await sock.sendMessage(from, { 
       text: error 
         ? '❌ Erro ao guardar dados. Tente novamente.' 
-        : `✅ Dados guardados com sucesso!\nMatrícula: ${state.matricula}\nQuilómetros: ${kms}`
+        : `✅ Dados guardados!\nMatrícula: ${state.matricula}\nQuilómetros: ${kms}`
     });
 
     conversationState.delete(from);
+  }
+}
+
+function scheduleWeeklyMessages(sock) {
+  // Calcular próxima segunda-feira às 9h
+  function getNextMonday() {
+    const now = new Date();
+    const dayOfWeek = now.getDay();
+    const daysUntilMonday = dayOfWeek === 0 ? 1 : 8 - dayOfWeek;
+    
+    const nextMonday = new Date(now);
+    nextMonday.setDate(now.getDate() + daysUntilMonday);
+    nextMonday.setHours(9, 0, 0, 0);
+    
+    return nextMonday;
+  }
+
+  function scheduleNext() {
+    const nextMonday = getNextMonday();
+    const delay = nextMonday - new Date();
+
+    console.log(`📅 Próximo envio: ${nextMonday.toLocaleString('pt-PT')}`);
+
+    setTimeout(async () => {
+      await sendWeeklyMessages(sock);
+      scheduleNext(); // Agendar próxima semana
+    }, delay);
+  }
+
+  scheduleNext();
+}
+
+async function sendWeeklyMessages(sock) {
+  console.log('📨 Enviando mensagens semanais...');
+
+  for (const number of CONTACT_NUMBERS) {
+    try {
+      conversationState.set(number, { step: 1 });
+      
+      await sock.sendMessage(number, {
+        text: '🚗 Olá! Está na altura de registar os quilómetros.\n\nPor favor indique a matrícula da viatura:'
+      });
+
+      console.log(`✅ Mensagem enviada para ${number}`);
+      
+      // Delay entre mensagens (evitar ban)
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    } catch (error) {
+      console.error(`❌ Erro ao enviar para ${number}:`, error);
+    }
   }
 }
 
